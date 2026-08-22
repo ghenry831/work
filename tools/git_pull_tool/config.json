@@ -1,0 +1,17 @@
+{
+  "concurrency": 5,
+  "remote": "origin",
+  "branch_pattern": "^feature_(\\d{2})(\\d{2})_([A-Z])",
+  "repos": [
+    {
+      "path": "C:/work/repo1"
+    },
+    {
+      "path": "C:/work/repo2",
+      "branch": "feature_2609_A"
+    },
+    {
+      "path": "D:/projects/repo3"
+    }
+  ]
+}

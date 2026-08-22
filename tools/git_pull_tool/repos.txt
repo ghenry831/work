@@ -1,0 +1,6 @@
+# 每行填写一个本地 Git 仓库目录路径
+# 空行和以 # 开头的行会被忽略
+
+C:/work/repo1
+C:/work/repo2
+D:/projects/repo3
