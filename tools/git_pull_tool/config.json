@@ -2,16 +2,23 @@
   "concurrency": 5,
   "remote": "origin",
   "branch_pattern": "^feature_(\\d{2})(\\d{2})_([A-Z])",
+  "gerrit": {
+    "user": "001096000",
+    "host": "scm-sh.sdc.cs.icbc",
+    "port": 29418,
+    "clone_root": "D:/git",
+    "enabled": true
+  },
   "repos": [
     {
-      "path": "C:/work/repo1"
+      "path": "D:/git/aasaas/aasbi"
     },
     {
-      "path": "C:/work/repo2",
+      "path": "D:/git/repo2",
       "branch": "feature_2609_A"
     },
     {
-      "path": "D:/projects/repo3"
+      "path": "D:/git/repo3"
     }
   ]
 }

@@ -150,7 +150,11 @@ def checkout_and_pull(
     return "success", f"成功切换到 {branch} 并拉取最新代码"
 
 
-def process_repo(repo_config: Dict[str, Any], dry_run: bool) -> Dict[str, Any]:
+def process_repo(
+    repo_config: Dict[str, Any],
+    gerrit_config: Optional[Dict[str, Any]],
+    dry_run: bool,
+) -> Dict[str, Any]:
     """处理单个仓库。返回结果字典。"""
     repo_path = Path(repo_config["path"])
     remote = repo_config["remote"]
@@ -165,9 +169,40 @@ def process_repo(repo_config: Dict[str, Any], dry_run: bool) -> Dict[str, Any]:
     }
 
     if not repo_path.exists():
-        result["status"] = "error"
-        result["message"] = "仓库路径不存在"
-        return result
+        if gerrit_config and gerrit_config.get("enabled"):
+            clone_root = gerrit_config.get("clone_root")
+            if not clone_root:
+                result["status"] = "error"
+                result["message"] = "Gerrit 配置缺少 clone_root，无法推导工程名"
+                return result
+
+            project = derive_project_name(repo_path, Path(clone_root))
+            if not project:
+                result["status"] = "error"
+                result[
+                    "message"
+                ] = f"仓库路径 {repo_path} 不在 clone_root {clone_root} 下，无法推导 Gerrit 工程名"
+                return result
+
+            clone_url = build_clone_url(project, gerrit_config)
+            status, message = clone_repo(repo_path, clone_url, remote, dry_run)
+
+            if dry_run:
+                branch_hint = configured_branch or "最新分支"
+                result["status"] = "skipped"
+                result[
+                    "message"
+                ] = f"{message}，然后切换到 {branch_hint} 并执行 git pull"
+                return result
+
+            if status != "success":
+                result["status"] = status
+                result["message"] = message
+                return result
+        else:
+            result["status"] = "error"
+            result["message"] = "仓库路径不存在"
+            return result
 
     if not is_git_repo(repo_path):
         result["status"] = "error"
@@ -225,6 +260,13 @@ def build_default_config(repos: List[Dict[str, str]]) -> Dict[str, Any]:
         "concurrency": DEFAULT_CONCURRENCY,
         "remote": DEFAULT_REMOTE,
         "branch_pattern": DEFAULT_BRANCH_PATTERN,
+        "gerrit": {
+            "user": "",
+            "host": "",
+            "port": 29418,
+            "clone_root": "",
+            "enabled": False,
+        },
         "repos": repos,
     }
 
@@ -273,6 +315,81 @@ def scan_repos(root: Path, output: Path, force: bool) -> None:
     print(f"已扫描 {root}，发现 {len(repos)} 个仓库，生成配置: {output}")
 
 
+def load_gerrit_config(raw: Dict[str, Any], base_dir: Path) -> Optional[Dict[str, Any]]:
+    """读取并校验 Gerrit SSH 克隆配置。"""
+    gerrit_raw = raw.get("gerrit")
+    if not gerrit_raw:
+        return None
+    if not isinstance(gerrit_raw, dict):
+        raise ValueError("gerrit 配置必须是 JSON 对象")
+
+    enabled = gerrit_raw.get("enabled", True)
+    if not enabled:
+        return {"enabled": False}
+
+    required_fields = ["user", "host", "port", "clone_root"]
+    missing = [field for field in required_fields if not gerrit_raw.get(field)]
+    if missing:
+        raise ValueError(
+            f"gerrit 自动克隆已启用，但缺少字段: {', '.join(missing)}"
+        )
+
+    clone_root = Path(gerrit_raw["clone_root"])
+    if not clone_root.is_absolute():
+        clone_root = (base_dir / clone_root).resolve()
+
+    return {
+        "enabled": True,
+        "user": gerrit_raw["user"],
+        "host": gerrit_raw["host"],
+        "port": int(gerrit_raw["port"]),
+        "clone_root": str(clone_root),
+    }
+
+
+def derive_project_name(repo_path: Path, clone_root: Path) -> Optional[str]:
+    """根据本地仓库路径和 clone_root 推导 Gerrit 工程名。"""
+    try:
+        rel = repo_path.resolve().relative_to(clone_root.resolve())
+    except ValueError:
+        return None
+    project = rel.as_posix().strip("/")
+    return project or None
+
+
+def build_clone_url(project: str, gerrit: Dict[str, Any]) -> str:
+    """构造 Gerrit SSH 克隆地址。"""
+    project = project.strip("/")
+    return f"ssh://{gerrit['user']}@{gerrit['host']}:{gerrit['port']}/{project}"
+
+
+def clone_repo(
+    repo_path: Path, clone_url: str, remote: str, dry_run: bool
+) -> Tuple[str, str]:
+    """通过 SSH 克隆仓库到指定路径。"""
+    if dry_run:
+        return "skipped", f"[模拟] 将克隆 {clone_url} 到 {repo_path}"
+
+    repo_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = ["git", "clone"]
+    if remote != DEFAULT_REMOTE:
+        cmd.extend(["-o", remote])
+    cmd.extend([clone_url, str(repo_path)])
+    logging.debug("执行: %s", " ".join(cmd))
+
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr.strip() or proc.stdout.strip()).replace("\n", " ")
+        return "error", f"克隆失败: {detail}"
+    return "success", f"已成功克隆到 {repo_path}"
+
+
 def load_config(config_path: Path) -> Dict[str, Any]:
     """读取配置文件，并补齐默认值与绝对路径。"""
     with config_path.open("r", encoding="utf-8") as f:
@@ -305,6 +422,7 @@ def load_config(config_path: Path) -> Dict[str, Any]:
         }
         config["repos"].append(repo_conf)
 
+    config["gerrit"] = load_gerrit_config(raw, base_dir)
     return config
 
 
@@ -325,7 +443,7 @@ def pull_repos(config: Dict[str, Any], dry_run: bool) -> None:
 
     with ThreadPoolExecutor(max_workers=config["concurrency"]) as executor:
         future_to_repo = {
-            executor.submit(process_repo, repo, dry_run): repo
+            executor.submit(process_repo, repo, config.get("gerrit"), dry_run): repo
             for repo in config["repos"]
         }
         for future in as_completed(future_to_repo):

@@ -9,6 +9,7 @@
 - **支持分支后缀**：如 `feature_2609_A_gray`，判断时只取 `feature_2609_A` 前缀。
 - **支持指定分支**：配置 `branch` 后，直接拉取指定分支。
 - **并发拉取**：可配置并发数，批量拉取节省时间。
+- **自动克隆缺失仓库**：本地目录不存在时，可通过 Gerrit SSH 自动克隆并继续切到最新分支。
 - **冲突识别**：只在真正发生冲突或切换失败时跳过并记录，不影响的本地改动不干预。
 - **配置初始化**：支持从 txt 文件或扫描目录生成初始配置。
 - **日志记录**：每次运行生成独立日志文件，方便排查。
@@ -54,6 +55,8 @@ python git_pull.py --init-txt repos.txt --output config.json
 python git_pull.py --scan C:/work --output config.json
 ```
 
+生成的 `config.json` 会自带一个 `gerrit` 模板（默认 `enabled: false`）。如果需要自动克隆缺失仓库，请填写 `user`、`host`、`clone_root` 等字段，并将 `enabled` 改为 `true`。
+
 ### 3. 运行拉取
 
 ```cmd
@@ -73,19 +76,31 @@ python git_pull.py --config config.json --dry-run
   "concurrency": 5,
   "remote": "origin",
   "branch_pattern": "^feature_(\\d{2})(\\d{2})_([A-Z])",
+  "gerrit": {
+    "user": "001096000",
+    "host": "scm-sh.sdc.cs.icbc",
+    "port": 29418,
+    "clone_root": "D:/git",
+    "enabled": true
+  },
   "repos": [
-    { "path": "C:/work/repo1" },
-    { "path": "C:/work/repo2", "branch": "feature_2609_A" },
-    { "path": "D:/projects/repo3" }
+    { "path": "D:/git/aasaas/aasbi" },
+    { "path": "D:/git/repo2", "branch": "feature_2609_A" },
+    { "path": "D:/git/repo3" }
   ]
 }
 ```
 
 | 字段 | 说明 |
 |---|---|
-| `concurrency` | 并发拉取数，默认 5 |
+| `concurrency` | 并发拉取数，默认 `5` |
 | `remote` | 远程仓库名，默认 `origin` |
 | `branch_pattern` | 识别最新分支的正则，默认匹配 `feature_YYMM_X` |
+| `gerrit.user` | Gerrit SSH 用户名 |
+| `gerrit.host` | Gerrit SSH 主机 |
+| `gerrit.port` | Gerrit SSH 端口 |
+| `gerrit.clone_root` | 本地仓库根目录，用于从 `path` 推导 Gerrit 工程名 |
+| `gerrit.enabled` | 是否开启缺失自动克隆，默认 `true` |
 | `repos[].path` | 本地仓库路径，Windows 下可用 `/` 或 `\\` |
 | `repos[].branch` | 可选，指定要拉取的分支；不填则自动找最新 |
 | `repos[].remote` | 可选，覆盖单个仓库的远程名 |
@@ -109,6 +124,39 @@ origin/feature_2609_A_gray
 3. 同年月下比较后缀字母，越大越新（`A < B < C < D`）。
 4. 最终选择 `feature_2610_A`。
 5. 切分支时优先使用完全匹配的 `origin/feature_2610_A`；不存在时才用带后缀的变体。
+
+## Gerrit 自动克隆
+
+当配置文件中启用了 `gerrit` 段且某个仓库的本地目录不存在时，工具会尝试通过 SSH 从 Gerrit 自动克隆该仓库。
+
+配置示例：
+
+```json
+{
+  "gerrit": {
+    "user": "001096000",
+    "host": "scm-sh.sdc.cs.icbc",
+    "port": 29418,
+    "clone_root": "D:/git",
+    "enabled": true
+  }
+}
+```
+
+仓库名推导规则：
+
+1. 取 `repos[].path`，例如 `D:/git/aasaas/aasbi`。
+2. 取 `gerrit.clone_root`，例如 `D:/git`。
+3. 用相对路径得到 Gerrit 工程名 `aasaas/aasbi`。
+4. 拼接为 SSH 克隆地址：`ssh://001096000@scm-sh.sdc.cs.icbc:29418/aasaas/aasbi`。
+
+前置条件：
+
+- 本地已配置可通过 Gerrit 认证的 SSH 密钥。
+- Git 已加入系统 PATH。
+- `clone_root` 必须是所有待克隆仓库的公共根目录，且仓库路径必须位于其下。
+
+克隆完成后，工具会继续按 `branch_pattern` 查找最新分支并执行 `git checkout` + `git pull`。
 
 ## 命令行参数
 
@@ -198,6 +246,16 @@ py -3.8 git_pull.py
 ### 3. 远程名不是 origin
 
 在配置文件中设置 `remote` 字段，或给单个仓库设置 `repos[].remote`。
+
+### 4. 目录不存在时自动克隆失败
+
+- 检查 `gerrit` 段是否填写完整：`user`、`host`、`port`、`clone_root`。
+- 确认 `path` 位于 `clone_root` 之下，否则无法推导 Gerrit 工程名。
+- 确认本地 SSH 密钥已配置，并且能直接访问 Gerrit，例如：
+  ```bash
+  ssh -p 29418 001096000@scm-sh.sdc.cs.icbc
+  ```
+- 克隆失败不会清理已创建的目录，请根据日志手动处理后再次运行。
 
 ## 扩展预留
 
