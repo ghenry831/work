@@ -1,25 +1,29 @@
-# git_pull_tool - 自动化 Git 代码拉取工具
+# git_pull_tool - Gerrit 全量同步的自动化 Git 代码拉取工具
 
-在公司内管理 30~40 个本地 Git 仓库时，可以借助本工具一键或定时批量拉取每个仓库的最新代码。
+工具默认从 Gerrit 动态获取当前用户**有权限的全部项目**，自动克隆到本地根目录（如 `D:/git`）并切到最新分支拉取代码；本地已有的仓库（包括不在 Gerrit 列表中的）也会一并更新。新增仓库权限（如 `aaschans/app`）后，无需改任何配置，双击运行脚本即可自动克隆出 `D:/git/aaschans/app`。
 
 ## 功能特点
 
-- **可配置仓库列表**：通过 JSON 配置文件维护所有本地仓库路径。
+- **Gerrit 全量同步**：运行时执行 `ssh -p 29418 user@host gerrit ls-projects` 获取有权限的项目列表，新项目自动克隆，已有项目自动更新。
 - **自动识别最新分支**：未指定分支时，自动从远程分支中按 `feature_YYMM_X` 规则选出最新分支。
 - **支持分支后缀**：如 `feature_2609_A_gray`，判断时只取 `feature_2609_A` 前缀。
 - **支持指定分支**：配置 `branch` 后，直接拉取指定分支。
 - **并发拉取**：可配置并发数，批量拉取节省时间。
-- **自动克隆缺失仓库**：本地目录不存在时，可通过 Gerrit SSH 自动克隆并继续切到最新分支。
+- **存量仓库更新**：本地根目录下已有但不在 Gerrit 列表中的仓库，也会一并切分支并拉取。
 - **冲突识别**：只在真正发生冲突或切换失败时跳过并记录，不影响的本地改动不干预。
-- **配置初始化**：支持从 txt 文件或扫描目录生成初始配置。
 - **日志记录**：每次运行生成独立日志文件，方便排查。
 - **模拟运行**：`--dry-run` 可先查看工具会如何处理而不修改仓库。
+- **兼容旧模式**：`gerrit.enabled: false` 时退回纯 `repos[]` 列表模式，行为与旧版一致。
 
 ## 环境要求
 
 - Windows 10
 - Python 3.8+
 - Git（已加入系统 PATH）
+- 已配置可通过 Gerrit 认证的 SSH 密钥，且能直接执行：
+  ```bash
+  ssh -p 29418 001096000@scm-sh.sdc.cs.icbc gerrit ls-projects
+  ```
 
 ## 项目结构
 
@@ -27,37 +31,29 @@
 git_pull_tool/
 ├── git_pull.py      # 主程序
 ├── config.json      # 配置文件
-├── repos.txt        # 可选：仓库路径列表模板
+├── repos.txt        # 可选：旧模式仓库路径列表模板
 └── README.md        # 使用说明
 ```
 
 ## 快速开始
 
-### 1. 准备仓库路径
+### 1. 填写 Gerrit 配置
 
-把本地所有 Git 仓库的路径按行写入 `repos.txt`，例如：
+编辑 `config.json` 的 `gerrit` 段（只需一次）：
 
-```text
-C:/work/repo1
-C:/work/repo2
-D:/projects/repo3
+```json
+{
+  "gerrit": {
+    "user": "001096000",
+    "host": "scm-sh.sdc.cs.icbc",
+    "port": 29418,
+    "clone_root": "D:/git",
+    "enabled": true
+  }
+}
 ```
 
-### 2. 生成配置文件
-
-```cmd
-python git_pull.py --init-txt repos.txt --output config.json
-```
-
-或者扫描某个目录下的所有 `.git` 仓库：
-
-```cmd
-python git_pull.py --scan C:/work --output config.json
-```
-
-生成的 `config.json` 会自带一个 `gerrit` 模板（默认 `enabled: false`）。如果需要自动克隆缺失仓库，请填写 `user`、`host`、`clone_root` 等字段，并将 `enabled` 改为 `true`。
-
-### 3. 运行拉取
+### 2. 运行
 
 ```cmd
 python git_pull.py --config config.json
@@ -68,6 +64,16 @@ python git_pull.py --config config.json
 ```cmd
 python git_pull.py --config config.json --dry-run
 ```
+
+运行流程：
+
+1. 通过 SSH 执行 `gerrit ls-projects`，获取你有权限的全部项目。
+2. 对每个项目，本地路径 = `clone_root` + 项目名（如 `D:/git` + `aaschans/app` → `D:/git/aaschans/app`）。
+3. 本地不存在 → 自动通过 SSH 克隆；已存在 → 切到最新分支并 `git pull`。
+4. 扫描 `clone_root` 下已有但不在 Gerrit 列表中的仓库，也一并更新。
+5. 输出汇总：总数 / 成功 / 新克隆 / 冲突 / 失败 / 跳过。
+
+之后每当你在新申请了一个 Gerrit 仓库权限后，直接再运行一次脚本即可。
 
 ## 配置文件说明
 
@@ -83,11 +89,7 @@ python git_pull.py --config config.json --dry-run
     "clone_root": "D:/git",
     "enabled": true
   },
-  "repos": [
-    { "path": "D:/git/aasaas/aasbi" },
-    { "path": "D:/git/repo2", "branch": "feature_2609_A" },
-    { "path": "D:/git/repo3" }
-  ]
+  "repos": []
 }
 ```
 
@@ -99,11 +101,34 @@ python git_pull.py --config config.json --dry-run
 | `gerrit.user` | Gerrit SSH 用户名 |
 | `gerrit.host` | Gerrit SSH 主机 |
 | `gerrit.port` | Gerrit SSH 端口 |
-| `gerrit.clone_root` | 本地仓库根目录，用于从 `path` 推导 Gerrit 工程名 |
-| `gerrit.enabled` | 是否开启缺失自动克隆，默认 `true` |
-| `repos[].path` | 本地仓库路径，Windows 下可用 `/` 或 `\\` |
-| `repos[].branch` | 可选，指定要拉取的分支；不填则自动找最新 |
+| `gerrit.clone_root` | 本地仓库根目录，Gerrit 项目会按项目名克隆到其下 |
+| `gerrit.enabled` | `true`（默认）时启用 Gerrit 全量同步模式；`false` 时退回旧模式 |
+| `repos[].path` | 可选，指定额外仓库（如不在 `clone_root` 之下的仓库） |
+| `repos[].branch` | 可选，固定拉取某分支；也可用于覆盖 Gerrit 同步项目中同路径仓库的分支 |
 | `repos[].remote` | 可选，覆盖单个仓库的远程名 |
+
+`repos[]` 在同步模式下是**可选的**：留空即可；其中位于 `clone_root` 之下的条目会与 Gerrit 项目按路径合并（其 `branch`/`remote` 生效），位于之外的条目作为额外仓库处理。
+
+## 旧模式（不使用 Gerrit 同步）
+
+将 `gerrit.enabled` 设为 `false`（或删除 `gerrit` 段），工具只处理 `repos[]` 中列出的仓库，行为与旧版一致。
+
+也可以用 txt 文件初始化仓库列表：
+
+```text
+C:/work/repo1
+C:/work/repo2
+```
+
+```cmd
+python git_pull.py --init-txt repos.txt --output config.json
+```
+
+或者扫描某个目录下的所有 `.git` 仓库：
+
+```cmd
+python git_pull.py --scan C:/work --output config.json
+```
 
 ## 最新分支判断规则
 
@@ -125,39 +150,6 @@ origin/feature_2609_A_gray
 4. 最终选择 `feature_2610_A`。
 5. 切分支时优先使用完全匹配的 `origin/feature_2610_A`；不存在时才用带后缀的变体。
 
-## Gerrit 自动克隆
-
-当配置文件中启用了 `gerrit` 段且某个仓库的本地目录不存在时，工具会尝试通过 SSH 从 Gerrit 自动克隆该仓库。
-
-配置示例：
-
-```json
-{
-  "gerrit": {
-    "user": "001096000",
-    "host": "scm-sh.sdc.cs.icbc",
-    "port": 29418,
-    "clone_root": "D:/git",
-    "enabled": true
-  }
-}
-```
-
-仓库名推导规则：
-
-1. 取 `repos[].path`，例如 `D:/git/aasaas/aasbi`。
-2. 取 `gerrit.clone_root`，例如 `D:/git`。
-3. 用相对路径得到 Gerrit 工程名 `aasaas/aasbi`。
-4. 拼接为 SSH 克隆地址：`ssh://001096000@scm-sh.sdc.cs.icbc:29418/aasaas/aasbi`。
-
-前置条件：
-
-- 本地已配置可通过 Gerrit 认证的 SSH 密钥。
-- Git 已加入系统 PATH。
-- `clone_root` 必须是所有待克隆仓库的公共根目录，且仓库路径必须位于其下。
-
-克隆完成后，工具会继续按 `branch_pattern` 查找最新分支并执行 `git checkout` + `git pull`。
-
 ## 命令行参数
 
 ```text
@@ -169,8 +161,8 @@ usage: git_pull.py [-h] [--config CONFIG] [--dry-run]
   -h, --help         显示帮助信息
   --config CONFIG    配置文件路径（默认: config.json）
   --dry-run          模拟运行，不修改仓库
-  --init-txt TXT     从 txt 文件初始化配置
-  --scan DIR         扫描目录生成配置
+  --init-txt TXT     从 txt 文件初始化配置（旧模式）
+  --scan DIR         扫描目录生成配置（旧模式）
   --output OUTPUT    生成配置时的输出路径（默认: config.json）
   --force            覆盖已存在的输出配置文件
 ```
@@ -211,7 +203,7 @@ C:\Python38\python.exe git_pull.py --config config.json
 pause
 ```
 
-双击即可运行。
+双击即可运行：自动发现 Gerrit 上有权限的新仓库并克隆，同时更新所有存量仓库。
 
 ## 日志
 
@@ -247,18 +239,18 @@ py -3.8 git_pull.py
 
 在配置文件中设置 `remote` 字段，或给单个仓库设置 `repos[].remote`。
 
-### 4. 目录不存在时自动克隆失败
+### 4. gerrit ls-projects 执行失败
 
-- 检查 `gerrit` 段是否填写完整：`user`、`host`、`port`、`clone_root`。
-- 确认 `path` 位于 `clone_root` 之下，否则无法推导 Gerrit 工程名。
-- 确认本地 SSH 密钥已配置，并且能直接访问 Gerrit，例如：
-  ```bash
-  ssh -p 29418 001096000@scm-sh.sdc.cs.icbc
-  ```
-- 克隆失败不会清理已创建的目录，请根据日志手动处理后再次运行。
+- 确认能直接在命令行执行：`ssh -p 29418 001096000@scm-sh.sdc.cs.icbc gerrit ls-projects`。
+- 确认本地 SSH 密钥已配置且 Gerrit 账号有相应权限。
+- 命令超时时间为 120 秒，内网异常时可稍后重试。
+
+### 5. 克隆或拉取卡死
+
+git 命令默认 300 秒超时，超时会在日志中标记为该仓库失败，不影响其他仓库。
 
 ## 扩展预留
 
-- 支持 YAML/TOML 配置
 - 拉取成功后执行自定义 hook
 - 失败时发送邮件/IM 通知
+- Gerrit 项目过滤（include/exclude 前缀）

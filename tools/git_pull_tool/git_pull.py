@@ -18,6 +18,8 @@ DEFAULT_CONFIG = "config.json"
 DEFAULT_CONCURRENCY = 5
 DEFAULT_REMOTE = "origin"
 DEFAULT_BRANCH_PATTERN = r"^feature_(\d{2})(\d{2})_([A-Z])"
+GIT_CMD_TIMEOUT = 300
+LS_PROJECTS_TIMEOUT = 120
 
 LOG_DIR = Path("logs")
 
@@ -30,17 +32,27 @@ CONFLICT_KEYWORDS = [
 ]
 
 
-def run_git(repo_path: Path, args: List[str], check: bool = False) -> Tuple[int, str, str]:
+def run_git(
+    repo_path: Path,
+    args: List[str],
+    check: bool = False,
+    timeout: int = GIT_CMD_TIMEOUT,
+) -> Tuple[int, str, str]:
     """在指定仓库目录下执行 git 命令，返回 (returncode, stdout, stderr)。"""
     cmd = ["git", "-C", str(repo_path)] + args
     logging.debug("执行: %s", " ".join(cmd))
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        logging.warning("命令超时(%ds): %s", timeout, " ".join(cmd))
+        return 124, "", f"命令执行超时（>{timeout}s）"
     if check and proc.returncode != 0:
         raise subprocess.CalledProcessError(
             proc.returncode, cmd, output=proc.stdout, stderr=proc.stderr
@@ -166,6 +178,7 @@ def process_repo(
         "target_branch": configured_branch,
         "status": "pending",
         "message": "",
+        "cloned": False,
     }
 
     if not repo_path.exists():
@@ -199,6 +212,7 @@ def process_repo(
                 result["status"] = status
                 result["message"] = message
                 return result
+            result["cloned"] = True
         else:
             result["status"] = "error"
             result["message"] = "仓库路径不存在"
@@ -299,17 +313,21 @@ def init_from_txt(txt_path: Path, output: Path, force: bool) -> None:
     print(f"已从 {txt_path} 生成配置，共 {len(repos)} 个仓库: {output}")
 
 
-def scan_repos(root: Path, output: Path, force: bool) -> None:
-    """扫描目录下的 Git 仓库并生成配置。"""
-    repos: List[Dict[str, str]] = []
+def walk_git_repos(root: Path) -> List[Path]:
+    """扫描目录下所有 Git 仓库（发现 .git 目录即停止下钻），返回排序后的路径列表。"""
+    repos: List[Path] = []
     for dirpath, dirnames, _filenames in os.walk(root):
         if ".git" in dirnames:
-            repo_dir = Path(dirpath).resolve()
-            repos.append({"path": repo_dir.as_posix()})
+            repos.append(Path(dirpath).resolve())
             # 不再进入该仓库内部继续扫描
             dirnames.remove(".git")
+    repos.sort(key=lambda p: p.as_posix())
+    return repos
 
-    repos.sort(key=lambda x: x["path"])
+
+def scan_repos(root: Path, output: Path, force: bool) -> None:
+    """扫描目录下的 Git 仓库并生成配置。"""
+    repos = [{"path": p.as_posix()} for p in walk_git_repos(root)]
     config = build_default_config(repos)
     save_config(config, output, force)
     print(f"已扫描 {root}，发现 {len(repos)} 个仓库，生成配置: {output}")
@@ -377,17 +395,120 @@ def clone_repo(
     cmd.extend([clone_url, str(repo_path)])
     logging.debug("执行: %s", " ".join(cmd))
 
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=GIT_CMD_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return "error", f"克隆超时（>{GIT_CMD_TIMEOUT}s）: {clone_url}"
     if proc.returncode != 0:
         detail = (proc.stderr.strip() or proc.stdout.strip()).replace("\n", " ")
         return "error", f"克隆失败: {detail}"
     return "success", f"已成功克隆到 {repo_path}"
+
+
+def list_gerrit_projects(gerrit: Dict[str, Any]) -> List[str]:
+    """通过 SSH 执行 gerrit ls-projects，返回当前用户有权限的全部项目名。"""
+    cmd = [
+        "ssh",
+        "-p",
+        str(gerrit["port"]),
+        f"{gerrit['user']}@{gerrit['host']}",
+        "gerrit",
+        "ls-projects",
+    ]
+    logging.debug("执行: %s", " ".join(cmd))
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=LS_PROJECTS_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"gerrit ls-projects 执行超时（>{LS_PROJECTS_TIMEOUT}s）")
+    except OSError as exc:
+        raise RuntimeError(f"无法执行 ssh 命令: {exc}")
+
+    if proc.returncode != 0:
+        detail = (proc.stderr.strip() or proc.stdout.strip()).replace("\n", " ")
+        raise RuntimeError(f"gerrit ls-projects 执行失败: {detail}")
+
+    projects = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    projects.sort()
+    return projects
+
+
+def build_sync_repos(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """组装同步任务清单：Gerrit 全量项目 + clone_root 下存量仓库 + repos[] 额外条目。"""
+    gerrit = config["gerrit"]
+    clone_root = Path(gerrit["clone_root"])
+
+    projects = list_gerrit_projects(gerrit)
+    logging.info("Gerrit 返回 %d 个有权限的项目", len(projects))
+
+    # repos[] 中的覆盖项按规范化路径索引，供 Gerrit 项目合并 branch/remote 等设置
+    overrides: Dict[str, Dict[str, Any]] = {}
+    for repo in config["repos"]:
+        overrides[str(Path(repo["path"]).resolve())] = repo
+
+    repos: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    def add_repo(
+        path: Path,
+        branch: Optional[str] = None,
+        remote: Optional[str] = None,
+        branch_pattern: Optional[str] = None,
+    ) -> None:
+        key = str(path.resolve())
+        if key in seen:
+            return
+        seen.add(key)
+        repos.append(
+            {
+                "path": key,
+                "branch": branch,
+                "remote": remote or config["remote"],
+                "branch_pattern": branch_pattern or config["branch_pattern"],
+            }
+        )
+
+    # 1. Gerrit 全量项目，本地路径 = clone_root + 项目名
+    for project in projects:
+        repo_path = clone_root / project
+        override = overrides.get(str(repo_path.resolve()), {})
+        add_repo(
+            repo_path,
+            branch=override.get("branch"),
+            remote=override.get("remote"),
+            branch_pattern=override.get("branch_pattern"),
+        )
+
+    # 2. clone_root 下已存在但不在 Gerrit 列表中的存量仓库，一并更新
+    for existing in walk_git_repos(clone_root):
+        add_repo(existing)
+
+    # 3. repos[] 中位于 clone_root 之外的额外仓库
+    for repo in config["repos"]:
+        add_repo(
+            Path(repo["path"]),
+            branch=repo.get("branch"),
+            remote=repo.get("remote"),
+            branch_pattern=repo.get("branch_pattern"),
+        )
+
+    logging.info(
+        "任务清单: Gerrit 项目 %d 个，合计待处理 %d 个仓库", len(projects), len(repos)
+    )
+    return repos
 
 
 def load_config(config_path: Path) -> Dict[str, Any]:
@@ -426,12 +547,14 @@ def load_config(config_path: Path) -> Dict[str, Any]:
     return config
 
 
-def pull_repos(config: Dict[str, Any], dry_run: bool) -> None:
+def pull_repos(
+    config: Dict[str, Any], repos: List[Dict[str, Any]], dry_run: bool
+) -> None:
     """并发拉取所有仓库。"""
     results: List[Dict[str, Any]] = []
-    total = len(config["repos"])
+    total = len(repos)
     if total == 0:
-        logging.warning("配置文件中没有仓库")
+        logging.warning("没有待处理的仓库")
         return
 
     logging.info(
@@ -441,10 +564,11 @@ def pull_repos(config: Dict[str, Any], dry_run: bool) -> None:
         dry_run,
     )
 
+    gerrit = config.get("gerrit")
     with ThreadPoolExecutor(max_workers=config["concurrency"]) as executor:
         future_to_repo = {
-            executor.submit(process_repo, repo, config.get("gerrit"), dry_run): repo
-            for repo in config["repos"]
+            executor.submit(process_repo, repo, gerrit, dry_run): repo
+            for repo in repos
         }
         for future in as_completed(future_to_repo):
             result = future.result()
@@ -468,9 +592,10 @@ def pull_repos(config: Dict[str, Any], dry_run: bool) -> None:
     conflict = sum(1 for r in results if r["status"] == "conflict")
     error = sum(1 for r in results if r["status"] == "error")
     skipped = sum(1 for r in results if r["status"] == "skipped")
+    cloned = sum(1 for r in results if r.get("cloned"))
 
     summary = (
-        f"汇总: 总数={total}, 成功={success}, 冲突={conflict}, "
+        f"汇总: 总数={total}, 成功={success}, 新克隆={cloned}, 冲突={conflict}, "
         f"失败={error}, 跳过={skipped}"
     )
     logging.info(summary)
@@ -536,7 +661,15 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         config = load_config(config_path)
         setup_logging(LOG_DIR)
-        pull_repos(config, args.dry_run)
+
+        gerrit = config.get("gerrit")
+        if gerrit and gerrit.get("enabled"):
+            # 默认模式：从 Gerrit 同步全量有权限的仓库
+            repos = build_sync_repos(config)
+        else:
+            repos = config["repos"]
+
+        pull_repos(config, repos, args.dry_run)
         return 0
 
     except Exception as exc:  # pylint: disable=broad-except
